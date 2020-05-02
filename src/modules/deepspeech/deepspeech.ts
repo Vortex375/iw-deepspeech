@@ -3,7 +3,7 @@ import { IwDeepstreamClient } from 'iw-base/modules/deepstream-client';
 import { getLogger } from 'iw-base/lib/logging';
 import Ds from 'deepspeech';
 import Sox from 'sox-stream';
-import PulseAudio from 'pulseaudio2';
+import { RtAudio, RtAudioFormat } from 'audify';
 import MemoryStream from 'memory-stream';
 // Speaker typedefs appear to be broken
 // tslint:disable-next-line: no-var-requires
@@ -21,11 +21,11 @@ export interface DeepSpeechConfig {
 export class DeepSpeechService extends Service {
 
   private model: Ds.Model;
-  private paContext = new PulseAudio();
+  private rtAudio: RtAudio;
 
-  private recordStream: any;
-  private memoryBuffer: MemoryStream;
   private recording: boolean;
+  private transformStream: NodeJS.ReadWriteStream;
+  private memoryBuffer: MemoryStream;
 
   private recordingTimer: any;
 
@@ -33,37 +33,33 @@ export class DeepSpeechService extends Service {
     super('DeepSpeechService');
   }
 
-  start(config: DeepSpeechConfig): Promise<void> {
-    return new Promise((resolve) => {
-      this.setState(State.BUSY, 'Loading DeepSpeech Model...');
-      this.model = new Ds.Model(config.modelPath);
-      if (config.scorerPath) {
-        this.setState(State.BUSY, 'Loading Scorer...');
-        this.model.enableExternalScorer(config.scorerPath);
-      }
-      log.debug({ beamWidth: this.model.beamWidth(), sampleRate: this.model.sampleRate() }, 'Model load complete.');
+  async start(config: DeepSpeechConfig){
+    this.setState(State.BUSY, 'Loading DeepSpeech Model...');
+    this.model = new Ds.Model(config.modelPath);
+    if (config.scorerPath) {
+      this.setState(State.BUSY, 'Loading Scorer...');
+      this.model.enableExternalScorer(config.scorerPath);
+    }
+    log.debug({ beamWidth: this.model.beamWidth(), sampleRate: this.model.sampleRate() }, 'Model load complete.');
 
-      this.setState(State.BUSY, 'Connecting to PulseAudio ...')
-      this.paContext = new PulseAudio(),
-      this.paContext.on('connection', () => {
-        this.setState(State.OK, 'Ready for voice input');
-        resolve();
-      });
-      this.paContext.on('error', (err) => {
-        log.error({ err }, 'PulseAudio failed');
-        this.setState(State.ERROR, 'PulseAudio failed');
-      });
-    })
-    .then(() => {
-      this.ds.subscribeEvent('voice-input/request-start-record', () => this.startRecording());
-      this.ds.subscribeEvent('voice-input/request-stop-record', () => this.stopRecording());
-    });
+    this.setState(State.BUSY, 'Setting up RtAudio ...');
+    this.rtAudio = new RtAudio();
+    const devices = this.rtAudio.getDevices();
+    const inputDeviceId = this.rtAudio.getDefaultInputDevice();
+    log.debug({ deviceInfo: devices[inputDeviceId] }, `using device ${devices[inputDeviceId].name} via ${this.rtAudio.getApi()}`);
 
+    this.ds.subscribeEvent('voice-input/request-start-record', () => this.startRecording());
+    this.ds.subscribeEvent('voice-input/request-stop-record', () => this.stopRecording());
+
+    this.setState(State.OK, 'Ready for voice input');
   }
 
   async stop(): Promise<void> {
-    this.paContext.end();
-    this.paContext = undefined;
+    if (this.recording) {
+      this.rtAudio.closeStream();
+    }
+    this.recording = false;
+    this.rtAudio = undefined;
     this.model = undefined;
     this.setState(State.INACTIVE);
   }
@@ -73,14 +69,23 @@ export class DeepSpeechService extends Service {
       return;
     }
     this.recording = true;
-    this.recordStream = this.paContext.createRecordStream({
-      channels: 1,
-      format: 'S24LE',
-      rate: 48000
-    });
-    const transform = Sox({
+    this.rtAudio.openStream(
+      undefined, /* audio output device (unused) */
+      {
+        deviceId: this.rtAudio.getDefaultInputDevice(),
+        nChannels: 1,
+        firstChannel: 0
+      },
+      RtAudioFormat.RTAUDIO_FLOAT32,
+      48000, /* sample rate */
+      2400, /* chunk size (50ms) */
+      'Iw DeepSpeech Record Stream', /* stream name */
+      (pcm) => this.transformStream.write(pcm), /* input callback */
+      undefined /* output callback (unused) */
+    );
+    this.transformStream = Sox({
       input: {
-        type: 's24',
+        type: 'f32',
         rate: 48000,
         endian: 'little',
         channels: 1
@@ -92,17 +97,16 @@ export class DeepSpeechService extends Service {
         channels: 1
       },
       effects: [
-        // ['noisered'], ['/home/vortex/workspace/audio/speech.noise-profile'], ['0.3'],
-        ['gain'], ['-n'], ['-1']
+        ['gain'], ['-n'], ['-3']
       ]
     });
-    transform.on('error', (err) => {
+    this.transformStream.on('error', (err) => {
       /* sox likes to print stuff to stderr which is treated as 'error' */
       log.warn('sox', err);
     });
     this.memoryBuffer = new MemoryStream();
-    this.recordStream.pipe(transform);
-    transform.pipe(this.memoryBuffer);
+    this.transformStream.pipe(this.memoryBuffer);
+    this.rtAudio.start();
 
     this.setState(State.BUSY, 'Recording is active ...');
     this.ds.emitEvent('voice-input/start-record');
@@ -120,7 +124,9 @@ export class DeepSpeechService extends Service {
       this.recordingTimer = undefined;
     }
 
-    this.recordStream.end();
+    this.rtAudio.stop();
+    this.rtAudio.closeStream();
+    this.transformStream.end();
     this.memoryBuffer.on('finish', () => {
       log.debug('playing back audio');
       const buffer = this.memoryBuffer.toBuffer();
@@ -131,9 +137,11 @@ export class DeepSpeechService extends Service {
         sampleRate: 16000
       });
       speaker.end(buffer);
-      log.debug('playback ok');
-      const text = this.runInference(this.memoryBuffer.toBuffer());
-      this.ds.emitEvent('voice-input/text', text);
+      speaker.on('close', () => {
+        log.debug('playback ok');
+        const text = this.runInference(this.memoryBuffer.toBuffer());
+        this.ds.emitEvent('voice-input/text', text);
+      });
     });
     this.ds.emitEvent('voice-input/stop-record');
   }

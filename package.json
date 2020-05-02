@@ -16,7 +16,6 @@
     "audify": "^1.5.2",
     "deepspeech": "^0.7.0",
     "iw-base": "^0.0.1",
-    "pulseaudio2": "^0.2.2",
     "sox-stream": "^2.0.3",
     "speaker": "^0.5.1"
   },

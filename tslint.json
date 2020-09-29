@@ -1,6 +1,7 @@
 {
   "extends": "tslint:recommended",
   "rules": {
+    "array-type": [true, "array-simple"],
     "class-name": true,
     "comment-format": [
       true,
@@ -35,8 +36,8 @@
     "interface-name": false,
     "trailing-comma": [
       true,
-      { 
-        "multiline": "ignore",
+      {
+        "multiline": "never",
         "singleline": "never"
       }
     ],

@@ -27,13 +27,13 @@ export class DeepSpeechService extends Service {
   private transformStream: NodeJS.ReadWriteStream;
   private memoryBuffer: MemoryStream;
 
-  private recordingTimer: any;
+  private recordingTimer: NodeJS.Timeout;
 
   constructor(private ds: IwDeepstreamClient) {
     super('DeepSpeechService');
   }
 
-  async start(config: DeepSpeechConfig){
+  async start(config: DeepSpeechConfig) {
     this.setState(State.BUSY, 'Loading DeepSpeech Model...');
     this.model = new Ds.Model(config.modelPath);
     if (config.scorerPath) {
@@ -73,12 +73,11 @@ export class DeepSpeechService extends Service {
       undefined, /* audio output device (unused) */
       {
         deviceId: this.rtAudio.getDefaultInputDevice(),
-        nChannels: 1,
-        firstChannel: 0
+        nChannels: 1
       },
       RtAudioFormat.RTAUDIO_FLOAT32,
       48000, /* sample rate */
-      2400, /* chunk size (50ms) */
+      2400, /* frame size (50ms) */
       'Iw DeepSpeech Record Stream', /* stream name */
       (pcm) => this.transformStream.write(pcm), /* input callback */
       undefined /* output callback (unused) */
@@ -148,8 +147,6 @@ export class DeepSpeechService extends Service {
 
   private runInference(audioBuffer: Buffer): string {
     this.setState(State.BUSY, 'Running inference ...');
-    // [sic] We take half of the buffer_size because buffer is a char* while
-    // LocalDsSTT() expected a short*
     const text = this.model.stt(audioBuffer);
     log.info('Inferred text:', text);
     this.setState(State.OK, 'Ready for voice input');
